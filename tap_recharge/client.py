@@ -3,6 +3,7 @@ import requests
 from requests.exceptions import ConnectionError
 from singer import metrics, utils
 import singer
+import functools
 
 LOGGER = singer.get_logger()
 
@@ -70,6 +71,7 @@ ERROR_CODE_EXCEPTION_MAPPING = {
 def get_exception_for_error_code(error_code):
     return ERROR_CODE_EXCEPTION_MAPPING.get(error_code, RechargeError)
 
+
 def raise_for_error(response):
     try:
         response.raise_for_status()
@@ -92,9 +94,29 @@ def raise_for_error(response):
                         and resume extraction.")
                 raise ex(message)
             else:
+                if error.response.status_code == 429:
+                    raise Server429Error(error)
                 raise RechargeError(error)
         except (ValueError, TypeError):
             raise RechargeError(error)
+
+
+def leaky_bucket_handler(details):
+    LOGGER.info("Received 429 -- sleeping for %s seconds",
+                details['wait'])
+
+
+def recharge_error_handling(fnc):
+    @backoff.on_exception(backoff.expo,
+                          Server429Error,
+                          on_backoff=leaky_bucket_handler,
+                          # No jitter as we want a constant value
+                          jitter=None)
+    @functools.wraps(fnc)
+    def wrapper(*args, **kwargs):
+        return fnc(*args, **kwargs)
+
+    return wrapper
 
 
 class RechargeClient(object):
@@ -114,10 +136,7 @@ class RechargeClient(object):
     def __exit__(self, exception_type, exception_value, traceback):
         self.__session.close()
 
-    @backoff.on_exception(backoff.expo,
-                          Server5xxError,
-                          max_tries=5,
-                          factor=2)
+    @recharge_error_handling
     def check_access_token(self):
         if self.__access_token is None:
             raise Exception('Error: Missing access_token.')
@@ -136,12 +155,7 @@ class RechargeClient(object):
         else:
             return True
 
-
-    @backoff.on_exception(backoff.expo,
-                          (Server5xxError, ConnectionError, Server429Error),
-                          max_tries=5,
-                          factor=2)
-    # Call/rate limit: https://developer.rechargepayments.com/#call-limit
+    @recharge_error_handling
     @utils.ratelimit(160, 60)
     def request(self, method, path=None, url=None, **kwargs):
         if not self.__verified:
